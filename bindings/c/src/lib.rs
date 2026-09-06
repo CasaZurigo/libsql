@@ -288,6 +288,16 @@ pub unsafe extern "C" fn libsql_open_sync_with_config(
                 });
             }
         };
+        if config.sync_interval > 0 {
+            let interval = match config.sync_interval.try_into() {
+                Ok(d) => d,
+                Err(e) => {
+                    set_err_msg(format!("Wrong periodic sync interval: {e}"), out_err_msg);
+                    return 4;
+                }
+            };
+            builder = builder.sync_interval(std::time::Duration::from_secs(interval));
+        }
         match RT.block_on(builder.build()) {
             Ok(db) => {
                 let db = Box::leak(Box::new(libsql_database { db }));
