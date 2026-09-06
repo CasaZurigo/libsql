@@ -74,6 +74,8 @@ impl Builder<()> {
                     #[cfg(feature = "sync")]
                     sync_protocol: Default::default(),
                     #[cfg(feature = "sync")]
+                    synced_remote_writes: None,
+                    #[cfg(feature = "sync")]
                     remote_encryption: None
                 },
             }
@@ -117,6 +119,7 @@ impl Builder<()> {
                     remote_writes: false,
                     push_batch_size: 0,
                     sync_interval: None,
+                    skip_safety_assert: false,
                     remote_encryption: None,
                 },
             }
@@ -242,6 +245,8 @@ cfg_replication! {
         #[cfg(feature = "sync")]
         sync_protocol: super::SyncProtocol,
         #[cfg(feature = "sync")]
+        synced_remote_writes: Option<bool>,
+        #[cfg(feature = "sync")]
         remote_encryption: Option<EncryptionContext>,
     }
 
@@ -347,6 +352,17 @@ cfg_replication! {
             self
         }
 
+        /// Override the write mode of the synced database that sync protocol v2
+        /// delegates to: `Some(false)` makes writes local-first.
+        #[cfg(feature = "sync")]
+        pub fn synced_remote_writes(
+            mut self,
+            remote_writes: Option<bool>,
+        ) -> Builder<RemoteReplica> {
+            self.inner.synced_remote_writes = remote_writes;
+            self
+        }
+
         /// Build the remote embedded replica database.
         pub async fn build(self) -> Result<Database> {
             let RemoteReplica {
@@ -367,6 +383,8 @@ cfg_replication! {
                 skip_safety_assert,
                 #[cfg(feature = "sync")]
                 sync_protocol,
+                #[cfg(feature = "sync")]
+                synced_remote_writes,
                 #[cfg(feature = "sync")]
                 remote_encryption,
             } = self.inner;
@@ -434,8 +452,16 @@ cfg_replication! {
                             tracing::trace!("Using sync protocol v2 for {}", url);
                             let mut builder = Builder::new_synced_database(path, url, auth_token)
                                 .connector(connector)
-                                .remote_writes(true)
                                 .read_your_writes(read_your_writes);
+
+                            if skip_safety_assert {
+                                builder = unsafe { builder.skip_safety_assert(true) };
+                            }
+
+                            builder = match synced_remote_writes {
+                                Some(remote_writes) => builder.remote_writes(remote_writes),
+                                None => builder.remote_writes(true),
+                            };
 
                             if let Some(encryption) = remote_encryption {
                                 builder = builder.remote_encryption(encryption);
@@ -590,6 +616,7 @@ cfg_sync! {
         read_your_writes: bool,
         push_batch_size: u32,
         sync_interval: Option<std::time::Duration>,
+        skip_safety_assert: bool,
         remote_encryption: Option<EncryptionContext>,
     }
 
@@ -612,6 +639,13 @@ cfg_sync! {
 
         pub fn set_push_batch_size(mut self, v: u32) -> Builder<SyncedDatabase> {
             self.inner.push_batch_size = v;
+            self
+        }
+
+        /// Skip the safety assert that requires sqlite3 SERIALIZED threadsafe mode.
+        /// UNSAFE: the caller must uphold the sqlite3 threadsafe rules.
+        pub unsafe fn skip_safety_assert(mut self, skip: bool) -> Builder<SyncedDatabase> {
+            self.inner.skip_safety_assert = skip;
             self
         }
 
@@ -662,6 +696,7 @@ cfg_sync! {
                 read_your_writes,
                 push_batch_size,
                 sync_interval,
+                skip_safety_assert,
                 remote_encryption,
             } = self.inner;
 
@@ -680,15 +715,31 @@ cfg_sync! {
 
             let connector = crate::util::ConnectorService::new(svc);
 
-            let db = crate::local::Database::open_local_with_offline_writes(
-                connector.clone(),
-                path,
-                flags,
-                url.clone(),
-                auth_token.clone(),
-                remote_encryption.clone(),
-            )
-            .await?;
+            let db = if skip_safety_assert {
+                // SAFETY: this can only be enabled via the unsafe config function
+                // `skip_safety_assert`.
+                unsafe {
+                    crate::local::Database::open_local_with_offline_writes2(
+                        connector.clone(),
+                        path,
+                        flags,
+                        url.clone(),
+                        auth_token.clone(),
+                        remote_encryption.clone(),
+                    )
+                    .await?
+                }
+            } else {
+                crate::local::Database::open_local_with_offline_writes(
+                    connector.clone(),
+                    path,
+                    flags,
+                    url.clone(),
+                    auth_token.clone(),
+                    remote_encryption.clone(),
+                )
+                .await?
+            };
 
             if push_batch_size > 0 {
                 db.sync_ctx.as_ref().unwrap().lock().await.set_push_batch_size(push_batch_size);

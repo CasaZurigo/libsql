@@ -235,6 +235,38 @@ impl Database {
         Ok(db)
     }
 
+    /// Safety: like `open_local_with_offline_writes` but skips the sqlite3
+    /// SERIALIZED threadsafe assert.
+    #[doc(hidden)]
+    pub async unsafe fn open_local_with_offline_writes2(
+        connector: crate::util::ConnectorService,
+        db_path: impl Into<String>,
+        flags: OpenFlags,
+        endpoint: String,
+        auth_token: String,
+        remote_encryption: Option<crate::database::EncryptionContext>,
+    ) -> Result<Database> {
+        let db_path = db_path.into();
+        let endpoint = if endpoint.starts_with("libsql:") {
+            endpoint.replace("libsql:", "https:")
+        } else {
+            endpoint
+        };
+        let mut db = unsafe { Database::open_raw(&db_path, flags)? };
+
+        let sync_ctx = SyncContext::new(
+            connector,
+            db_path.into(),
+            endpoint,
+            Some(auth_token),
+            remote_encryption,
+        )
+        .await?;
+        db.sync_ctx = Some(Arc::new(Mutex::new(sync_ctx)));
+
+        Ok(db)
+    }
+
     #[cfg(feature = "replication")]
     pub async fn open_local_sync(
         db_path: impl Into<String>,
